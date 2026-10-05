@@ -22,7 +22,9 @@ OutboxPublisher запускается и в producer, и в consumer. Он вы
 
 Webhook является отдельным Python-сервисом на FastAPI. Он принимает POST /webhook, проверяет тело по общей схеме PaymentNotification, пишет уведомление в логи и возвращает 200. Это получатель для демонстрации доставки, отдельного хранения уведомлений в нём нет. Внутри compose его адрес http://webhook:9000/webhook, с компьютера он доступен на http://localhost:9000/webhook.
 
-Запуск из корня проекта с Docker и файлом .env:
+Перед запуском скопировать .env.example в .env и указать API_KEY. Адреса PostgreSQL и RabbitMQ внутри контейнеров задаются в compose.
+
+Запуск из корня проекта с Docker:
 
 docker compose up --build -d
 
