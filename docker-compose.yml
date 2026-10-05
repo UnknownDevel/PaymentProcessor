@@ -1,0 +1,115 @@
+x-service: &service
+  env_file:
+    - .env
+  environment:
+    HOST: 0.0.0.0
+    PORT: "8000"
+    RELOAD: "false"
+    DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/postgres
+    RABBITMQ_URL: amqp://rabbit:rabbit@rabbitmq:5672/
+  init: true
+
+x-producer: &producer
+  <<: *service
+  image: payment-producer:local
+  build:
+    context: .
+    dockerfile: producer/Dockerfile
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: database
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    shm_size: 128mb
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: rabbit
+      RABBITMQ_DEFAULT_PASS: rabbit
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  migrate:
+    <<: *producer
+    command: ["python", "-m", "shared.db.migrate", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  producer:
+    <<: *producer
+    ports:
+      - "${PORT:-8000}:8000"
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  consumer:
+    <<: *service
+    image: payment-consumer:local
+    build:
+      context: .
+      dockerfile: consumer/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      webhook:
+        condition: service_healthy
+
+  webhook:
+    image: payment-webhook:local
+    build:
+      context: .
+      dockerfile: webhook/Dockerfile
+    ports:
+      - "9000:9000"
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://localhost:9000/health', timeout=2).close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
