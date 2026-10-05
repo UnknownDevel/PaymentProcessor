@@ -8,7 +8,7 @@ from faststream.rabbit import RabbitMessage
 from pydantic import ValidationError
 
 from shared.db.database import engine
-from messaging.events import DEAD_LETTER_QUEUE, MAX_ATTEMPTS, PaymentEvent
+from messaging.events import MAX_ATTEMPTS, PaymentEvent
 from messaging.broker import create_broker, declare_topology, payment_queue, retry_queues
 from messaging.outbox import OutboxPublisher
 from consumer.processor import InvalidPaymentEvent, PaymentProcessor
@@ -25,17 +25,33 @@ outbox_task: asyncio.Task[None] | None = None
 
 
 async def retry_message(
-    message: RabbitMessage, event: PaymentEvent, error: Exception
+    message: RabbitMessage, event: PaymentEvent, error: Exception | str
 ) -> None:
     payload = event.model_dump(mode="json")
-    headers = {"x-attempt": event.attempt, "x-last-error": str(error)[:2000]}
+    error_message = (
+        error if isinstance(error, str) else f"{type(error).__name__}: {error}"
+    )[:2000]
+    headers = {"x-attempt": event.attempt, "x-last-error": error_message}
     if event.attempt < MAX_ATTEMPTS:
         queue = retry_queues[event.attempt]
         payload["attempt"] = event.attempt + 1
         headers["x-attempt"] = event.attempt + 1
     else:
-        queue = DEAD_LETTER_QUEUE
-        payload.update(stage="consumer", error=f"{type(error).__name__}: {error}"[:2000])
+        try:
+            if processor is None:
+                raise RuntimeError("Payment processor is not initialized")
+            await processor.finalize_failure(event, error_message)
+        except InvalidPaymentEvent:
+            logger.exception("Unknown payment event was sent to the dead letter queue")
+            await message.reject(requeue=False)
+            return
+        except Exception:
+            logger.exception("Finalization will be retried for payment %s", event.payment_id)
+            queue = retry_queues[MAX_ATTEMPTS - 1]
+            headers["x-finalization-error"] = error_message
+        else:
+            await message.ack()
+            return
 
     try:
         await broker.publish(
@@ -50,6 +66,7 @@ async def retry_message(
         )
     except Exception:
         logger.exception("Failed to publish a retry for payment %s", event.payment_id)
+        await asyncio.sleep(settings.retry_base_delay)
         await message.nack(requeue=True)
     else:
         await message.ack()
@@ -63,9 +80,18 @@ async def process_payment(message: RabbitMessage) -> None:
         if not 1 <= attempt <= MAX_ATTEMPTS:
             raise ValueError("Invalid retry attempt")
         event = event.model_copy(update={"attempt": max(event.attempt, attempt)})
+        finalization_error = message.headers.get("x-finalization-error")
+        if finalization_error is not None and (
+            not isinstance(finalization_error, str) or event.attempt != MAX_ATTEMPTS
+        ):
+            raise ValueError("Invalid finalization message")
     except (ValidationError, ValueError, TypeError):
         logger.exception("Invalid payment message was sent to the dead letter queue")
         await message.reject(requeue=False)
+        return
+
+    if finalization_error is not None:
+        await retry_message(message, event, finalization_error)
         return
 
     try:

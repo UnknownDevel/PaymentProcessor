@@ -73,11 +73,13 @@ class PaymentProcessor:
         outbox_event: Outbox,
         payment: Payment,
         event: PaymentEvent,
-        error: Exception,
+        error: Exception | str,
         stage: str,
     ) -> None:
         now = utcnow()
-        error_message = f"{type(error).__name__}: {error}"[:2000]
+        error_message = (
+            error if isinstance(error, str) else f"{type(error).__name__}: {error}"
+        )[:2000]
         payment.last_error = error_message
         outbox_event.handled_at = now
 
@@ -116,6 +118,17 @@ class PaymentProcessor:
             event.attempt,
             error_message,
         )
+
+    async def finalize_failure(self, event: PaymentEvent, error: Exception | str) -> None:
+        if event.attempt != MAX_ATTEMPTS:
+            raise ValueError("Only the final attempt can be finalized")
+        async with session_factory() as session:
+            async with session.begin():
+                records = await self.lock_payment(session, event)
+                if records is None:
+                    return
+                outbox_event, payment = records
+                self.record_failure(session, outbox_event, payment, event, error, "consumer")
 
     async def process(self, event: PaymentEvent) -> None:
         async with session_factory() as session:
